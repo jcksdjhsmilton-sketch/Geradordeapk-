@@ -1,0 +1,107 @@
+name: Build APK a partir de ZIP
+
+on:
+  push:
+    paths:
+      - 'entrada/**'
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: 'Caminho do zip (ex: entrada/meuapp.zip)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle (usado se o projeto não tiver gradlew)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Aceitar licenças do Android SDK
+        run: yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Descobrir quais zips compilar
+        env:
+          INPUT_ZIP: ${{ inputs.zip }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          : > zips.txt
+          if [ -n "$INPUT_ZIP" ]; then
+            echo "$INPUT_ZIP" > zips.txt
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            git ls-tree -r --name-only HEAD -- entrada | grep -i '\.zip$' > zips.txt || true
+          else
+            git diff --name-only --diff-filter=AM "$BEFORE" "$GITHUB_SHA" -- entrada | grep -i '\.zip$' > zips.txt || true
+          fi
+          echo "Zips encontrados:"
+          cat zips.txt
+          if [ ! -s zips.txt ]; then
+            echo "Nenhum zip novo em entrada/. Nada a compilar."
+            exit 1
+          fi
+
+      - name: Descompactar e compilar
+        run: |
+          set -e
+          mkdir -p saida work
+          while IFS= read -r z; do
+            [ -z "$z" ] && continue
+            name=$(basename "$z" | sed 's/\.[zZ][iI][pP]$//')
+            work="work/$name"
+            mkdir -p "$work"
+            unzip -q -o "$z" -d "$work"
+
+            # acha a raiz do projeto Gradle (settings.gradle mais raso)
+            root=$(find "$work" \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/node_modules/*' \
+              | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2- | xargs -r -d '\n' dirname)
+            if [ -z "$root" ]; then
+              echo "::error::Não achei settings.gradle em $z. O zip precisa conter o projeto Android (Gradle)."
+              exit 1
+            fi
+            echo "Projeto '$name' em: $root"
+
+            (
+              cd "$root"
+              if [ -f gradlew ]; then
+                chmod +x gradlew
+                ./gradlew assembleDebug --no-daemon --stacktrace
+              else
+                gradle assembleDebug --no-daemon --stacktrace
+              fi
+            )
+
+            find "$root" -path '*/build/outputs/apk/*' -name '*.apk' | while IFS= read -r a; do
+              cp "$a" "saida/${name}-$(basename "$a")"
+            done
+          done < zips.txt
+
+          ls -lh saida
+          if ! ls saida/*.apk > /dev/null 2>&1; then
+            echo "::error::Build terminou mas nenhum APK foi gerado."
+            exit 1
+          fi
+
+      - name: Publicar APK numa Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: APK build #${{ github.run_number }}
+          files: saida/*.apk
+          
